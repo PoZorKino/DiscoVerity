@@ -1,0 +1,22 @@
+{
+  "discordToken": "PUT_YOUR_BOT_TOKEN_HERE",
+  "guildId": "PUT_YOUR_SERVER_ID_HERE",
+  "voiceChannelId": "PUT_YOUR_VOICE_CHANNEL_ID_HERE",
+  "textChannelId": "PUT_YOUR_TEXT_CHANNEL_ID_HERE",
+
+  "httpHost": "127.0.0.1",
+  "httpPort": 4100,
+
+  "answerTimeoutMs": 120000,
+  "systemEventTimeoutMs": 45000,
+  "fallbackMessage": "...",
+
+  "speakQuestions": true,
+  "ttsQuestionPrefix": "Minecraft player says: ",
+  "listenToVoice": true,
+  "listenToText": true,
+
+  "defaultVariant": "neutral",
+  "maxDiscordPostLength": 1800,
+  "voiceAnswerWindowMs": 60000
+}
