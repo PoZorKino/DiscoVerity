@@ -25,6 +25,7 @@ class Bridge extends EventEmitter {
     // Minecraft player's mic recordings, so Discord hears the real voice
     // instead of TTS of the transcription.
     this.playerVoices = new Map(); // normalizedText -> { pcm, at }
+    this.latestPlayerVoice = null;
   }
 
   buildVerityJson(message, variant, karmaChange) {
@@ -93,6 +94,7 @@ class Bridge extends EventEmitter {
         }, timeoutMs),
       };
       this.pending = entry;
+      console.log(`[Bridge] Question from Minecraft${isSystem ? ' (system)' : ''}: "${text.slice(0, 120)}"`);
       this.emit('question', { id: entry.id, text, isSystem, timeoutMs });
     });
   }
@@ -177,10 +179,12 @@ class Bridge extends EventEmitter {
    * Also stored under the first 256 chars: the mod truncates chat to 256.
    */
   rememberPlayerVoice(text, pcm48kStereo) {
-    if (!text || !pcm48kStereo || pcm48kStereo.length === 0) return;
+    if (!pcm48kStereo || pcm48kStereo.length === 0) return;
+    const entry = { pcm: pcm48kStereo, at: Date.now() };
+    this.latestPlayerVoice = entry;
+    if (!text) return;
     const keys = new Set([Bridge.normalizeText(text)]);
     if (text.length > 256) keys.add(Bridge.normalizeText(text.slice(0, 256)));
-    const entry = { pcm: pcm48kStereo, at: Date.now() };
     for (const key of keys) this.playerVoices.set(key, entry);
     while (this.playerVoices.size > 12) {
       const oldest = this.playerVoices.keys().next().value;
@@ -190,13 +194,19 @@ class Bridge extends EventEmitter {
 
   /**
    * Look up the Minecraft player's real mic clip for a question about to be
-   * spoken in Discord. Exact (normalized) text match only.
+   * spoken in Discord. Prefers an exact text match; otherwise the most recent
+   * clip (so PTT still plays in Discord when Whisper is disabled).
    */
   findPlayerVoice(inputText) {
     const window_ = this.config.voiceAnswerWindowMs || 60000;
     const key = Bridge.normalizeText(inputText);
     const exact = this.playerVoices.get(key);
     if (exact && Date.now() - exact.at <= window_) return exact;
+    // When Whisper is off there is no text key — play the most recent mic clip.
+    if (this.config && this.config.transcribeMinecraft === false) {
+      const latest = this.latestPlayerVoice;
+      if (latest && Date.now() - latest.at <= window_) return latest;
+    }
     return null;
   }
 

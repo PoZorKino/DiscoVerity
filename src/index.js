@@ -15,9 +15,11 @@ async function main() {
   const stt = new SttEngine(config);
   const tts = new TtsEngine(config);
 
-  // STT is used for Discord voice answers AND for the Minecraft player's mic
-  // (the mod uploads the recording here instead of transcribing locally).
-  stt.init();
+  if (config.listenToVoice || config.transcribeMinecraft) {
+    stt.init();
+  } else {
+    console.log('[STT] Whisper off — Discord answers are typed; Minecraft chat is not transcribed.');
+  }
   tts.init();
 
   startServer(config, bridge, tts, stt);

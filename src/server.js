@@ -34,7 +34,7 @@ function startServer(config, bridge, tts, stt) {
           res.end(JSON.stringify({ error: { message: err.message } }));
           return;
         }
-        handleTranscription(res, body, req.headers['content-type'] || '', bridge, stt);
+        handleTranscription(res, body, req.headers['content-type'] || '', bridge, stt, config);
       });
       return;
     }
@@ -51,7 +51,7 @@ function startServer(config, bridge, tts, stt) {
       return;
     }
 
-    if (req.method === 'POST' && url.pathname.endsWith('/chat/completions')) {
+    if (req.method === 'POST' && url.pathname.includes('chat/completions')) {
       collectBuffer(req, 2_000_000, async (err, body) => {
         if (err) {
           res.writeHead(413, { 'Content-Type': 'application/json' });
@@ -148,6 +148,7 @@ function handleSpeech(res, body, bridge, tts) {
   if (tts && tts.ready && input.trim()) {
     const pcm = tts.speak(input);
     if (pcm) {
+      console.log(`[Server] Serving Piper TTS for: "${input.slice(0, 60)}"`);
       res.writeHead(200, { 'Content-Type': 'audio/wav' });
       res.end(pcmToWav(pcm, 48000, 2));
       return;
@@ -158,8 +159,9 @@ function handleSpeech(res, body, bridge, tts) {
   res.end(JSON.stringify({ error: { message: 'No audio available' } }));
 }
 
-function handleTranscription(res, body, contentType, bridge, stt) {
-  if (!stt || !stt.ready) {
+function handleTranscription(res, body, contentType, bridge, stt, config) {
+  const skipStt = !config || config.transcribeMinecraft === false;
+  if (!skipStt && (!stt || !stt.ready)) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'STT engine not ready' } }));
     return;
@@ -182,17 +184,22 @@ function handleTranscription(res, body, contentType, bridge, stt) {
   const monoFloat = wav.channels === 1
     ? pcm16MonoToFloat(wav.data)
     : pcm16StereoToMonoFloat(wav.data);
-  const samples16k = resampleFloat(monoFloat, wav.sampleRate, 16000);
-  const text = stt.transcribe(samples16k);
 
-  // Convert the original mic clip to Discord's 48 kHz stereo so it can be
-  // played back later when the transcribed question arrives.
-  if (text) {
-    const samples48k = resampleFloat(monoFloat, wav.sampleRate, 48000);
-    const pcm48 = floatToPcm16Stereo(samples48k);
-    bridge.rememberPlayerVoice(text, pcm48);
-    console.log(`[Server] Minecraft player voice stored (${(pcm48.length / 4 / 48000).toFixed(2)}s): "${text}"`);
+  let text = '';
+  if (!skipStt) {
+    const samples16k = resampleFloat(monoFloat, wav.sampleRate, 16000);
+    text = stt.transcribe(samples16k);
   }
+
+  // Always keep the mic clip so Discord can play the real voice even when
+  // Whisper is off (matched later by transcription text, or as the latest clip).
+  const samples48k = resampleFloat(monoFloat, wav.sampleRate, 48000);
+  const pcm48 = floatToPcm16Stereo(samples48k);
+  bridge.rememberPlayerVoice(text, pcm48);
+  console.log(
+    `[Server] Minecraft player voice stored (${(pcm48.length / 4 / 48000).toFixed(2)}s)` +
+    (skipStt ? ' (no transcript — STT off)' : text ? `: "${text}"` : ' (empty transcript)')
+  );
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ text: text || '' }));

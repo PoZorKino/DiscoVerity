@@ -15,8 +15,50 @@ const {
 const { Readable } = require('stream');
 const OpusScript = require('opusscript');
 const { pcm16StereoToMonoFloat, resampleFloat } = require('./audio');
+const { pcmToWav } = require('./wav');
+const { toPcm48Stereo } = require('./audioConvert');
+
+// prism-media resolves ffmpeg-static by name; requiring it here fails fast if missing.
+require('ffmpeg-static');
 
 const MAX_UTTERANCE_SECONDS = 20;
+const OPUS_POOL_SIZE = 6;
+
+/** Reuse a fixed set of OpusScript instances. Creating a new one per speaker
+ *  exhausts the shared WASM heap (`memory access out of bounds`). */
+class OpusDecoderPool {
+  constructor() {
+    this.free = [];
+    this.inUse = new Map();
+    for (let i = 0; i < OPUS_POOL_SIZE; i++) {
+      this.free.push(new OpusScript(48000, 2, OpusScript.Application.AUDIO));
+    }
+    console.log(`[Discord] Opus decoder pool ready (${OPUS_POOL_SIZE} slots).`);
+  }
+
+  acquire(userId) {
+    if (this.inUse.has(userId)) return this.inUse.get(userId);
+    const dec = this.free.pop();
+    if (!dec) return null;
+    this.inUse.set(userId, dec);
+    return dec;
+  }
+
+  release(userId) {
+    const dec = this.inUse.get(userId);
+    if (!dec) return;
+    this.inUse.delete(userId);
+    this.free.push(dec);
+  }
+
+  destroy() {
+    for (const dec of [...this.inUse.values(), ...this.free]) {
+      try { dec.delete(); } catch { /* ignore */ }
+    }
+    this.inUse.clear();
+    this.free.length = 0;
+  }
+}
 
 class DiscordBridgeBot {
   constructor(config, bridge, stt, tts) {
@@ -40,6 +82,10 @@ class DiscordBridgeBot {
     this.speaking = false;
     this.activeSubscriptions = new Set();
     this.textChannel = null;
+    this.announceChannels = [];
+    this.decoderPool = null;
+    this.listening = false;
+    this.defaultSounds = new Map();
 
     this.player.on('stateChange', (oldS, newS) => {
       if (newS.status === 'idle' && oldS.status !== 'idle') {
@@ -49,6 +95,7 @@ class DiscordBridgeBot {
     });
     this.player.on('error', (e) => {
       console.warn('[Discord] Audio player error:', e.message);
+      if (e.stack) console.warn(e.stack);
       this.speaking = false;
       this.playNextInQueue();
     });
@@ -68,21 +115,8 @@ class DiscordBridgeBot {
         ? text.slice(0, this.config.maxDiscordPostLength) + '...'
         : text;
 
-      if (isSystem) {
-        await this.postToTextChannel(
-          `⚙️ **Verity event** *(auto-skips in ${Math.round(timeoutMs / 1000)}s if ignored)*:\n> ${shown}`
-        );
-        // Don't TTS-spam the voice channel for background events.
-        return;
-      }
-
-      await this.postToTextChannel(
-        `🎮 **A Minecraft player is talking to Verity:**\n> ${shown}\n` +
-        `*Reply in this channel or speak in voice — your words become Verity's. ` +
-        `(${Math.round(timeoutMs / 1000)}s to answer)*`
-      );
-
-      if (this.config.speakQuestions) {
+      // Play first so a slow Discord send never blocks the bot's voice.
+      if (!isSystem && this.config.speakQuestions) {
         const playerVoice = this.bridge.findPlayerVoice(text);
         if (playerVoice) {
           console.log('[Discord] Playing Minecraft player\'s real voice in the channel.');
@@ -91,6 +125,19 @@ class DiscordBridgeBot {
           this.enqueueSpeech(this.config.ttsQuestionPrefix + text);
         }
       }
+
+      if (isSystem) {
+        await this.postToTextChannel(
+          `⚙️ **Verity event** *(auto-skips in ${Math.round(timeoutMs / 1000)}s if ignored)*:\n> ${shown}`
+        );
+        return;
+      }
+
+      await this.postToTextChannel(
+        `🎮 **A Minecraft player is talking to Verity:**\n> ${shown}\n` +
+        `*Reply here, speak, or play a soundboard sound — that becomes Verity. ` +
+        `(${Math.round(timeoutMs / 1000)}s to answer)*`
+      );
     });
 
     this.bridge.on('answered', async ({ answeredBy }) => {
@@ -116,19 +163,50 @@ class DiscordBridgeBot {
     this.client.once(Events.ClientReady, async (c) => {
       console.log(`[Discord] Logged in as ${c.user.tag}`);
       try {
-        this.textChannel = await this.client.channels.fetch(this.config.textChannelId);
+        const textCh = await this.client.channels.fetch(this.config.textChannelId);
+        const voiceCh = await this.client.channels.fetch(this.config.voiceChannelId);
+        this.textChannel = textCh;
+        this.announceChannels = [textCh];
+        if (voiceCh && voiceCh.id !== textCh.id && typeof voiceCh.send === 'function') {
+          this.announceChannels.push(voiceCh);
+        }
+        console.log('[Discord] Posting to:', this.announceChannels.map((ch) => '#' + ch.name).join(', '));
+        try {
+          const defaults = await this.client.rest.get('/soundboard-default-sounds');
+          if (Array.isArray(defaults)) {
+            for (const s of defaults) this.defaultSounds.set(String(s.sound_id), s);
+            console.log(`[Discord] Loaded ${this.defaultSounds.size} default soundboard sound(s).`);
+          }
+        } catch (e) {
+          console.warn('[Discord] Could not fetch default soundboard sounds:', e.message);
+        }
+        try {
+          const guild = await this.client.guilds.fetch(this.config.guildId);
+          await guild.soundboardSounds.fetch();
+          console.log(`[Discord] Loaded ${guild.soundboardSounds.cache.size} guild soundboard sound(s).`);
+        } catch (e) {
+          console.warn('[Discord] Could not cache guild soundboard sounds:', e.message);
+        }
         await this.joinVoice();
         await this.postToTextChannel(
-          '🟢 **Verity bridge online.** Speak in voice or type here to become Verity. Minecraft players\' real voices will play in this channel.'
+          '🟢 **Verity bridge online.** Speak, use the soundboard, or type here to become Verity. ' +
+          'Minecraft players\' real voices play in this channel.'
         );
       } catch (e) {
         console.error('[Discord] Startup problem (check your channel IDs):', e.message);
       }
     });
 
+    this.client.on(Events.VoiceChannelEffectSend, (effect) => {
+      this.handleSoundboard(effect).catch((e) => {
+        console.warn('[Discord] Soundboard handling failed:', e.message);
+      });
+    });
+
     this.client.on(Events.MessageCreate, async (msg) => {
       if (msg.author.bot) return;
-      if (msg.channel.id !== this.config.textChannelId) return;
+      const allowed = new Set([this.config.textChannelId, this.config.voiceChannelId]);
+      if (!allowed.has(msg.channel.id)) return;
       if (!this.config.listenToText) return;
 
       const content = msg.content.trim();
@@ -181,7 +259,7 @@ class DiscordBridgeBot {
           '`!skip` — dismiss the current question\n' +
           '`!status` — show the pending question\n' +
           '`!join` / `!leave` — voice channel control\n\n' +
-          'To answer as Verity: just type or speak. Optional tags: `[happy]`, `[evil]`, `[serious_1]`, `[karma:+1]` etc. at the start of your message.'
+          'To answer as Verity: speak, play a soundboard sound, or type here. Optional tags: `[happy]`, `[evil]`, `[serious_1]`, `[karma:+1]` etc. at the start of your message.'
         ).catch(() => {});
         break;
     }
@@ -214,14 +292,24 @@ class DiscordBridgeBot {
     try {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 20000);
       console.log('[Discord] Voice connection ready.');
-      this.startListening();
+      this.listening = false;
+      if (this.config.listenToVoice) {
+        this.startListening();
+      } else {
+        console.log('[Discord] Voice STT disabled — type to answer as Verity.');
+      }
     } catch (e) {
       console.warn('[Discord] Could not join voice channel:', e.message);
     }
   }
 
   startListening() {
-    if (!this.connection) return;
+    if (!this.connection || !this.config.listenToVoice) return;
+    if (this.listening) return;
+    this.listening = true;
+    if (!this.decoderPool) this.decoderPool = new OpusDecoderPool();
+    console.log('[Discord] Listening to voice channel (speak to answer as Verity).');
+
     this.connection.receiver.speaking.on('start', (userId) => {
       if (!this.config.listenToVoice) return;
       if (this.activeSubscriptions.has(userId)) return;
@@ -229,29 +317,41 @@ class DiscordBridgeBot {
       const member = this.client.guilds.cache.get(this.config.guildId)?.members.cache.get(userId);
       if (member?.user?.bot) return;
 
+      const decoder = this.decoderPool.acquire(userId);
+      if (!decoder) {
+        console.warn('[Discord] Too many people talking at once; skipped a speaker.');
+        return;
+      }
+
       this.activeSubscriptions.add(userId);
       const opusStream = this.connection.receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: 900 },
       });
 
-      const decoder = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
       const chunks = [];
       let bytes = 0;
       const maxBytes = MAX_UTTERANCE_SECONDS * 48000 * 2 * 2; // s16 stereo
+      let finished = false;
+      const finishDecoder = () => {
+        if (finished) return;
+        finished = true;
+        this.activeSubscriptions.delete(userId);
+        this.decoderPool.release(userId);
+      };
 
       opusStream.on('data', (packet) => {
         if (bytes > maxBytes) return;
         try {
           const pcm = decoder.decode(packet);
-          chunks.push(Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength));
-          bytes += pcm.byteLength;
+          chunks.push(Buffer.from(pcm));
+          bytes += pcm.length;
         } catch (e) {
           // drop undecodable packet
         }
       });
 
       opusStream.on('end', () => {
-        this.activeSubscriptions.delete(userId);
+        finishDecoder();
         if (bytes < 4800) return; // ~25ms of audio: ignore blips
         const pcm = Buffer.concat(chunks); // 48 kHz stereo s16le - the real voice
         const mono = pcm16StereoToMonoFloat(pcm);
@@ -260,7 +360,7 @@ class DiscordBridgeBot {
       });
 
       opusStream.on('error', () => {
-        this.activeSubscriptions.delete(userId);
+        finishDecoder();
       });
     });
   }
@@ -281,6 +381,62 @@ class DiscordBridgeBot {
       await this.postToTextChannel(`🎙️ **${name}** *(voice → Verity)*: ${text}`);
     }
     // If nothing is pending, voice chatter is only logged to the console.
+  }
+
+  async handleSoundboard(effect) {
+    if (!this.config.listenToSoundboard) return;
+    if (!effect.soundId) return; // emoji-only voice effects
+    if (String(effect.channelId) !== String(this.config.voiceChannelId)) return;
+
+    const def = this.defaultSounds.get(String(effect.soundId));
+    const sound = effect.soundboardSound
+      || await this.resolveSoundboardSound(effect).catch(() => null);
+    const name = (sound && sound.name) || (def && def.name) || String(effect.soundId);
+    const url = (sound && sound.url)
+      ? sound.url
+      : `https://cdn.discordapp.com/soundboard-sounds/${effect.soundId}`;
+
+    const who = await this.resolveUserName(effect.userId);
+    console.log(`[Soundboard] ${who} played "${name}"`);
+
+    let file;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('CDN HTTP ' + res.status);
+      file = Buffer.from(await res.arrayBuffer());
+    } catch (e) {
+      console.warn('[Soundboard] Download failed:', e.message);
+      return;
+    }
+
+    let pcm;
+    try {
+      pcm = await toPcm48Stereo(file, effect.soundVolume == null ? 1 : effect.soundVolume);
+    } catch (e) {
+      console.warn('[Soundboard] Decode failed:', e.message);
+      return;
+    }
+    if (!pcm || pcm.length < 1000) return;
+
+    // Discord already plays the clip in the VC. Forward it to Minecraft as Verity.
+    const label = `*${name}*`;
+    const answered = this.bridge.submitAnswer(label, who, pcm);
+    if (answered) {
+      await this.postToTextChannel(`🔊 **${who}** *(soundboard → Verity)*: ${name}`);
+    }
+  }
+
+  async resolveSoundboardSound(effect) {
+    const guild = this.client.guilds.cache.get(this.config.guildId)
+      || await this.client.guilds.fetch(this.config.guildId);
+    const cached = guild.soundboardSounds.cache.get(effect.soundId)
+      || guild.soundboardSounds.cache.get(String(effect.soundId));
+    if (cached) return cached;
+    try {
+      return await guild.soundboardSounds.fetch(String(effect.soundId));
+    } catch {
+      return null;
+    }
   }
 
   async resolveUserName(userId) {
@@ -313,30 +469,48 @@ class DiscordBridgeBot {
       this.speaking = false;
       return;
     }
-    const stream = new Readable({
-      read() {
-        this.push(pcm);
-        this.push(null);
-      },
-    });
-    const resource = createAudioResource(stream, { inputType: StreamType.Raw });
-    this.speaking = true;
-    this.player.play(resource);
+    // StreamType.Raw encodes through opusscript, which throws
+    // "offset is out of bounds" after a few voice-receive decoders share its
+    // WASM heap. FFmpeg (libopus) is the reliable send path on Windows/Node 24.
+    try {
+      const wav = pcmToWav(Buffer.from(pcm), 48000, 2);
+      const resource = createAudioResource(Readable.from([wav]), {
+        inputType: StreamType.Arbitrary,
+      });
+      this.speaking = true;
+      this.player.play(resource);
+    } catch (e) {
+      console.warn('[Discord] Failed to start playback:', e.message);
+      this.speaking = false;
+      this.playNextInQueue();
+    }
   }
 
   // ---------------------------------------------------------------- helpers
 
   async postToTextChannel(content) {
-    if (!this.textChannel) return;
-    try {
-      await this.textChannel.send(content);
-    } catch (e) {
-      console.warn('[Discord] Failed to post to text channel:', e.message);
+    const channels = this.announceChannels.length
+      ? this.announceChannels
+      : (this.textChannel ? [this.textChannel] : []);
+    if (!channels.length) {
+      console.warn('[Discord] No text channel to post to yet.');
+      return;
+    }
+    for (const ch of channels) {
+      try {
+        await ch.send(content);
+      } catch (e) {
+        console.warn(`[Discord] Failed to post to #${ch.name || ch.id}:`, e.message);
+      }
     }
   }
 
   async stop() {
     if (this.connection) this.connection.destroy();
+    if (this.decoderPool) {
+      this.decoderPool.destroy();
+      this.decoderPool = null;
+    }
     this.client.destroy();
   }
 }
