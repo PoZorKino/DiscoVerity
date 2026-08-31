@@ -146,6 +146,39 @@ async function main() {
   if (bridge.findPlayerVoice('AAAAAAAAHHH')) throw new Error('player voice leaked onto unrelated text');
   console.log('Player voice clip bytes:', stored.pcm.length);
 
+  console.log('--- 8. Discord playback survives leaked Opus decoders ---');
+  // StreamType.Raw + opusscript throws "offset is out of bounds" after enough
+  // receive-decoder WASM allocations. Playback must go through FFmpeg instead.
+  const OpusScript = require('opusscript');
+  const { Readable } = require('stream');
+  const { createAudioResource, StreamType } = require('@discordjs/voice');
+  require('ffmpeg-static');
+  const leaked = [];
+  for (let i = 0; i < 80; i++) leaked.push(new OpusScript(48000, 2, OpusScript.Application.AUDIO));
+  const wav = pcmToWav(stored.pcm.slice(0, 48000 * 4), 48000, 2);
+  const resource = createAudioResource(Readable.from([wav]), { inputType: StreamType.Arbitrary });
+  const playResult = await new Promise((resolve) => {
+    let packets = 0;
+    const errs = [];
+    resource.playStream.on('data', () => packets++);
+    resource.playStream.on('error', (e) => errs.push(e.message));
+    resource.playStream.on('end', () => resolve({ packets, errs, ended: true }));
+    setTimeout(() => resolve({ packets, errs, ended: false }), 8000);
+  });
+  for (const d of leaked) {
+    try { d.delete(); } catch { /* ignore */ }
+  }
+  console.log('FFmpeg playback after 80 OpusScript instances:', playResult);
+  if (playResult.errs.length) throw new Error('playback error: ' + playResult.errs.join('; '));
+  if (!playResult.ended || playResult.packets < 5) throw new Error('expected FFmpeg to emit opus packets');
+
+  console.log('--- 9. ffmpeg converts soundboard-like audio to Discord PCM ---');
+  const { toPcm48Stereo } = require('./src/audioConvert');
+  const converted = await toPcm48Stereo(wav);
+  console.log('Converted PCM bytes:', converted.length);
+  if (converted.length < 1000) throw new Error('ffmpeg produced too little PCM');
+  if (converted.length % 4 !== 0) throw new Error('PCM is not stereo s16le aligned');
+
   server.close();
   console.log('\nALL SMOKE TESTS PASSED');
   process.exit(0);

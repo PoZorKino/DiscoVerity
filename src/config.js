@@ -39,6 +39,8 @@ function loadConfig() {
   cfg.ttsQuestionPrefix = typeof cfg.ttsQuestionPrefix === 'string' ? cfg.ttsQuestionPrefix : '';
   cfg.listenToVoice = cfg.listenToVoice !== false;
   cfg.listenToText = cfg.listenToText !== false;
+  cfg.listenToSoundboard = cfg.listenToSoundboard !== false;
+  cfg.transcribeMinecraft = cfg.transcribeMinecraft !== false;
   cfg.defaultVariant = cfg.defaultVariant || 'neutral';
   cfg.maxDiscordPostLength = Number(cfg.maxDiscordPostLength) || 1800;
   cfg.voiceAnswerWindowMs = Number(cfg.voiceAnswerWindowMs) || 60000;
